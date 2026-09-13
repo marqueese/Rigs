@@ -8,6 +8,19 @@ const selectedOrderParts = new Set();
 
 const datasetPaths = ['Rig 6(Dataset).csv', 'Rig(Dataset).csv'];
 const cataloguePaths = ['Parts catalogue.xlsx', 'Parts catalouge.xlsx'];
+const nestedComponentNames = new Set(['no.', 'pump head', 'pump no.', 'motor']);
+const groupedComponents = new Map([
+    ['centrifuge', { label: 'Centrifuge', mode: 'centrifuge' }],
+    ['drive motor', { label: 'Drive Motor', mode: 'centrifuge' }],
+    ['gearbox', { label: 'Gearbox', mode: 'centrifuge' }],
+    ['e.c.brake', { label: 'E.C.Brake', mode: 'centrifuge' }],
+    ['feed p/p', { label: 'Feed pump', mode: 'numbered' }],
+    ['poly pump', { label: 'POLY pump', mode: 'numbered' }],
+    ['metering p/p no.', { label: 'Metering pump', mode: 'numbered' }],
+    ['dmu', { label: 'DMU', mode: 'occurrence' }],
+    ['flow meter', { label: 'Flow meter', mode: 'application' }],
+    ['poly and water', { label: 'Poly and water', mode: 'occurrence' }]
+]);
 
 window.addEventListener('DOMContentLoaded', autoLoadFiles);
 
@@ -212,11 +225,12 @@ function getDatasetComponents() {
     const seen = new Set();
     datasetData.data.slice(1).forEach(row => {
         const component = (row[0] || '').trim();
-        if (component === 'No.') return;
-        const key = normalize(component);
-        if (component && !seen.has(key)) {
+        const group = groupedComponents.get(normalize(component));
+        const label = group?.label || component;
+        const key = normalize(label);
+        if (component && !nestedComponentNames.has(normalize(component)) && component !== 'No.' && !seen.has(key)) {
             seen.add(key);
-            components.push(component);
+            components.push(label);
         }
     });
     return components;
@@ -234,30 +248,79 @@ function extractRigsFromDataset(targetRigNumber) {
     rigColumns.forEach(({ value: rigNumber, index: columnIndex }) => {
         const fields = new Map();
         const entries = [];
+        const subsectionSets = {};
         let currentComponent = 'General';
         let currentCentrifugeNumber = '';
+        let activeGroupComponent = 'General';
+        let activeSubsection = '';
+        const occurrenceCounts = {};
+        const rememberSubsection = (component, subsection) => {
+            if (!subsection) return;
+            if (!subsectionSets[component]) subsectionSets[component] = [];
+            if (!subsectionSets[component].includes(subsection)) subsectionSets[component].push(subsection);
+        };
 
         datasetData.data.slice(1).forEach(row => {
             const rowComponent = (row[0] || '').trim();
-            if (rowComponent) currentComponent = rowComponent;
-
             const parameter = getDatasetParameter(row, columnIndex);
             const rigValue = row[columnIndex] || '';
-            if (!parameter || !rigValue.trim()) return;
 
             if (rowComponent === 'No.') currentCentrifugeNumber = rigValue.trim();
+
+            const group = groupedComponents.get(normalize(rowComponent));
+            if (group) {
+                currentComponent = rowComponent;
+                activeGroupComponent = group.label;
+                if (group.mode === 'centrifuge') {
+                    activeSubsection = currentCentrifugeNumber;
+                } else if (group.mode === 'numbered' && rigValue.trim()) {
+                    activeSubsection = rigValue.trim();
+                } else if (group.mode === 'application') {
+                    activeSubsection = '';
+                } else {
+                    occurrenceCounts[group.label] = (occurrenceCounts[group.label] || 0) + 1;
+                    activeSubsection = String(occurrenceCounts[group.label]);
+                }
+                rememberSubsection(group.label, activeSubsection);
+            } else if (rowComponent === 'No.') {
+                activeSubsection = currentCentrifugeNumber;
+                rememberSubsection('Centrifuge', activeSubsection);
+            } else if (activeGroupComponent === 'POLY pump' && normalize(rowComponent) === 'pump no.') {
+                activeSubsection = rigValue.trim();
+                rememberSubsection('POLY pump', activeSubsection);
+            } else if (rowComponent && !activeGroupComponent) {
+                currentComponent = rowComponent;
+            }
+
+            if (activeGroupComponent === 'Flow meter' && normalize(parameter) === 'application' && rigValue.trim()) {
+                activeSubsection = rigValue.trim();
+                rememberSubsection('Flow meter', activeSubsection);
+            }
+
+            if (rowComponent && !group && rowComponent !== 'No.' && !['Pump head', 'Motor', 'Pump No.'].includes(rowComponent)) {
+                currentComponent = rowComponent;
+                if (!groupedComponents.has(normalize(rowComponent))) activeGroupComponent = rowComponent;
+            }
+
+            if (group && !['Centrifuge', 'Drive Motor', 'Gearbox', 'E.C.Brake'].includes(group.label)) {
+                currentCentrifugeNumber = '';
+            }
+
+            if (!parameter || !rigValue.trim()) return;
 
             const entry = {
                 component: currentComponent,
                 name: parameter,
                 value: rigValue,
+                groupComponent: activeGroupComponent,
+                subsection: activeSubsection,
                 centrifugeNumber: currentCentrifugeNumber
             };
             entries.push(entry);
             if (!fields.has(normalize(parameter))) fields.set(normalize(parameter), entry);
         });
 
-        if (entries.length) rigs[`RIG ${rigNumber}`] = { fields, entries };
+        if (entries.length) rigs[`RIG ${rigNumber}`] = { fields, entries, subsections: subsectionSets };
     });
 
     rigColumnIndex = rigColumns.length ? rigColumns[0].index : -1;
@@ -298,24 +361,26 @@ function finalizeDataset(statusDiv, rigNumber) {
         componentSelector.appendChild(option);
     });
     componentSelector.disabled = false;
-    populateCentrifugeSelector(parsedRigs[rigNumbers[0]]?.entries || []);
+    populateSubsectionSelector(parsedRigs[rigNumbers[0]], componentSelector.value);
 
     statusDiv.innerHTML = `<div class="status success">✅ Dataset loaded! Found ${rigNumbers.length} RIG</div>`;
 }
 
-function populateCentrifugeSelector(entries) {
-    const centrifugeNumbers = [...new Set(entries
-        .map(entry => entry.centrifugeNumber)
-        .filter(Boolean))];
-    const centrifugeSelector = document.getElementById('centrifugeSelector');
-    centrifugeSelector.innerHTML = '<option value="">-- Select No. --</option>';
-    centrifugeNumbers.forEach(number => {
+function populateSubsectionSelector(rigData, componentName) {
+    const config = [...groupedComponents.values()].find(group => group.label === componentName);
+    const subsections = config && rigData
+        ? (rigData.subsections[componentName] || [])
+        : [];
+    const subsectionSelector = document.getElementById('subsectionSelector');
+    subsectionSelector.innerHTML = '<option value="">-- Select subsection --</option>';
+    subsections.forEach(number => {
         const option = document.createElement('option');
         option.value = number;
-        option.textContent = `No. ${number}`;
-        centrifugeSelector.appendChild(option);
+        option.textContent = /^\d+$/.test(number) ? `No. ${number}` : number;
+        subsectionSelector.appendChild(option);
     });
-    centrifugeSelector.disabled = centrifugeNumbers.length === 0;
+    subsectionSelector.disabled = subsections.length === 0;
+    document.getElementById('subsectionSelectorGroup').style.display = subsections.length ? 'flex' : 'none';
 }
 
 function normalizePartText(value) {
@@ -416,17 +481,20 @@ function fillForm() {
 
     const rigData = parsedRigs[selectedRig];
     const selectedComponent = document.getElementById('componentSelector').value;
-    const centrifugeSelectorGroup = document.getElementById('centrifugeSelectorGroup');
-    const centrifugeSelector = document.getElementById('centrifugeSelector');
-    const selectedCentrifuge = centrifugeSelector.value;
-    centrifugeSelectorGroup.style.display = selectedComponent === 'Centrifuge' ? 'flex' : 'none';
-    const visibleEntries = selectedComponent === 'Centrifuge'
-        ? (selectedCentrifuge
-            ? rigData.entries.filter(entry => entry.centrifugeNumber === selectedCentrifuge)
-            : [])
-        : selectedComponent
-            ? rigData.entries.filter(entry => entry.component === selectedComponent)
-            : rigData.entries;
+    const subsectionSelector = document.getElementById('subsectionSelector');
+    const previousSubsection = subsectionSelector.value;
+    populateSubsectionSelector(rigData, selectedComponent);
+    if ([...subsectionSelector.options].some(option => option.value === previousSubsection)) {
+        subsectionSelector.value = previousSubsection;
+    }
+    const selectedSubsection = subsectionSelector.value;
+    const selectedConfig = [...groupedComponents.values()].find(group => group.label === selectedComponent);
+    const visibleEntries = selectedComponent
+        ? selectedComponent === 'Centrifuge'
+            ? rigData.entries.filter(entry => entry.centrifugeNumber === selectedSubsection)
+            : rigData.entries.filter(entry => entry.groupComponent === selectedComponent &&
+                (!selectedConfig || entry.subsection === selectedSubsection))
+        : rigData.entries;
     let previewHTML = '';
     let filledCount = 0;
 
